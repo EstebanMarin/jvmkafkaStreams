@@ -106,9 +106,54 @@ object Hello {
     val productStream: KStream[UserId, Product] =
       userOrderStreams.flatMapValues(_.products)
 
-    builder.build()
+    // join
 
-    println("HELLO WORLD")
+    val ordersWithUserProfiles: KStream[UserId, (Order, Profile)] =
+      userOrderStreams.join(userProfileTable) {
+        (order: Order, profile: Profile) => (order, profile)
+      }
+
+    val discountedOrderStreams: KStream[UserId, Order] =
+      ordersWithUserProfiles.join(discountProfileGTable)(
+        { case (userId, (order, profile)) => profile },
+        { case ((order, profile), discount) =>
+          order.copy(amount = order.amount - discount.amount)
+        }
+      )
+
+    val orderStream: KStream[OrderId, Order] =
+      discountedOrderStreams.selectKey((userId, order) => order.orderId)
+
+    val paymentsTreams: KStream[OrderId, Payment] =
+      builder.stream[OrderId, Payment](PaymentsTopic)
+
+    val joinWindows = JoinWindows.of(Duration.of(5, ChronoUnit.MINUTES))
+
+    val joinOrderPayments: (Order, Payment) => Option[Order] =
+      (order: Order, payment: Payment) =>
+        if (payment.status == " PAID") Option(order) else Option.empty[Order]
+
+    val ordersPaid1 = orderStream
+      .join(paymentsTreams)(joinOrderPayments, joinWindows)
+      .filter((orderId, mayberOrder) => mayberOrder.nonEmpty)
+
+    val ordersPaid: KStream[OrderId, Order] = orderStream
+      .join(paymentsTreams)(joinOrderPayments, joinWindows)
+      .flatMapValues(maybeOrder => maybeOrder.toIterable)
+
+    ordersPaid.to(PaidOrdersTopic)
+
+    val topology: Topology = builder.build()
+
+    val props = new Properties
+    
+    props.put(StreamsConfig.APPLICATION_ID_CONFIG, "orders-application")
+    props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092")
+    props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.stringSerde.getClass())
+    
+    // println(topology.describe())
+    val application = new KafkaStreams(topology, props)
+    application.start()
   }
 
 }
